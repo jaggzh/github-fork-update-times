@@ -22,5 +22,6 @@ It caches the pages to reduce github API hits.
 * I'm not using perl's JSON parsing modules -- just regex's. :)
 * This uses forward slashes for local file paths
 * Also, it uses /tmp/
+* Probably not necessary to mention, but in some places I separate the github username from the repo with double underscore (__). This leaves the very-unlikely possibility of a name collision, but I'm mentioning it to be complete.
 
 
