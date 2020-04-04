@@ -1,0 +1,113 @@
+#!/usr/bin/perl
+use strict; use warnings;
+use File::Slurper qw(read_text read_lines write_text);
+$| = 1; # Flush stdout each write (so errors are intermingled well)
+
+# User your hot fresh github auth token or you'll be limited.
+# (I gave my token read:packages and read:user scope.)
+#  https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line#using-a-token-on-the-command-line
+
+# If you're only hitting their API a few times,
+#  you can set $auth_parms='' a few lines down \/ \/
+my $github_user='{your github username}';
+my $github_token='{your github auth token}';
+my $url="https://github.com/{some_user_here}/{some_repo_here}/network/members";
+my $auth_parms="-u '$github_user:$github_token'";
+#my $auth_parms=''; # I've not tested this
+my $verbose=0;
+
+my ($orig_user, $orig_repo) = ($url =~ m|github.com/(.*?)/(.*?)/|);
+my $cachedir_base="/tmp/github-forks-cache";
+my $prjdir="${orig_user}__$orig_repo";
+
+my $gurl = 'https://github.com';
+my $gapiurl = 'https://api.github.com';
+my @updates;
+
+print STDERR "Project name: $orig_repo\n";
+
+	$prjdir =~ tr|/\r\n \t|_|;
+	$prjdir = "$cachedir_base/$prjdir";
+
+	# Create base cache tmp dir
+	mkdir($cachedir_base, 0700) || $! == 17 || 
+		die "Error creating cachedir_base: $cachedir_base";
+	# Create project tmp dir
+	mkdir($prjdir, 0700) || $! == 17 || 
+		die "Error creating project tmpdir: $prjdir";
+print STDERR " Cache dir: $prjdir\n";
+
+my $fn_idx = "$prjdir/idx.html";
+print STDERR "Main Index: $fn_idx\n";
+
+	-f "$fn_idx" || `curl -u '$github_user:$github_token' -o "$fn_idx" "$url"`;
+	-f "$fn_idx" || die "Download of index unsuccessful";
+
+my @idx_html = read_lines($fn_idx);
+    # <a href="/user_here/repo_name_here">react-native-af-video-player</a>
+	for my $l (@idx_html) {
+		#print STDERR "Line: $l\n";
+		# Get forked project URI
+		#print STDERR "Checking for '^\s*<a href=\"(/[^/]+/$orig_repo)\">\n";
+		my ($user) = ($l =~ m|^\s*<a href="/([^/]+)/$orig_repo">|);
+		if (defined $user) {
+			my ($updated_at, @json_lines) =
+				handle_fork_updated_at($user, $orig_repo);
+			push(@updates, {
+				updated_at => $updated_at,
+				user => $user,
+				repo => $orig_repo
+			});
+		}
+	}
+print STDERR "Forks count: ", $#updates+1, "\n";
+my @up_sorted = sort { $b->{updated_at} cmp $a->{updated_at} } @updates;
+print map {update_fork_info($_) . "\n"} @up_sorted;
+exit;
+
+sub update_fork_info {
+	my $upref = shift;
+	my $user = $upref->{user} // die "Missing user. Sorry.";
+	my $repo = $upref->{repo} // die "Missing repo for user '$user'";
+	my $updat = $upref->{updated_at} // die "Missing updated_at for $user/$repo";
+	return "[$updat] $gurl/$user/$repo";
+}
+
+sub handle_fork_updated_at {
+	# Get fork update time
+	# "updated_at": "2019-01-21T10:00:42Z",
+	my $user = shift;
+	my $repo = shift;
+	$verbose > 0 && print STDERR "\n";
+	$verbose > 1 && print STDERR "Fork found    : $user/$repo\n";
+	my ($rurl, $cachefn) = get_cached_fork_json($user, $repo);
+	#print STDERR "  Retrieved to: $cachefn\n";
+	my @json_lines = read_lines($cachefn);
+	my $updated_at = (grep {/"updated_at":/} @json_lines)[0];
+	defined $updated_at || die "No updated_at json entry: $cachefn\nURL: $rurl";
+	$verbose > 2 && print STDERR "updated_at line: $updated_at\n";
+	($updated_at) = ($updated_at =~ (m|"updated_at": "(.*?)"|));
+	$verbose > 1 && print STDERR "$user/$repo: Update: $updated_at\n";
+	return ($updated_at, \@json_lines);
+}
+
+sub get_cached_fork_json {
+	my ($user, $repo) = @_;
+	my $url = "$gapiurl/repos/$user/$repo";
+	my $urlfile = "${user}_$repo";
+	$urlfile =~ tr|/|_|; # for safety
+	my $cachefn = "$prjdir/$urlfile";
+	-f "$cachefn" || store_url_data($cachefn, $url) ||
+		die "Don't have and couldn't retrieve fork: $url\nDestination: $cachefn";
+	return ($url, $cachefn);
+}
+
+sub store_url_data {
+	my ($fn, $url) = @_;
+	my $cmd = "curl -u '$github_user:$github_token' -o '$fn' '$url'";
+	print STDERR "Command: $cmd\n";
+	my $str = `$cmd`;
+	-f "$fn" || return 0;
+	return 1;
+}
+
