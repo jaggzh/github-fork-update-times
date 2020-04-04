@@ -18,6 +18,7 @@ It caches the pages to reduce github API hits.
 * Aside from the stuff in Setup, deleting cache must be done by hand.
   * Like when your hit/API limit is exceeded and the last file gets messed up content, you'll have to remove it by hand. It should output the full path so it's easy to remove, but still.
 * This is in perl
+* I experimented with indentation for code-readability.
 * I'm not using perl's HTTP modules -- I'm calling curl directly. Sorry.
 * I'm not using perl's JSON parsing modules -- just regex's. :)
 * This uses forward slashes for local file paths
