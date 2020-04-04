@@ -10,5 +10,6 @@ It caches the pages to reduce github API hits.
 * Aside from the stuff in Setup, deleting cache must be done by hand (like, on failed file lookups)
 * This is in perl
 * I'm not using perl's HTTP modules -- I'm calling curl directly. Sorry.
+* I'm not using perl's JSON parsing modules -- just regex's. :)
 
 
