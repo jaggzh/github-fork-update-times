@@ -1,61 +1,134 @@
 #!/usr/bin/perl
 # Pass the fork url (list of forks) from github
+# JSON from github is a hashref. We rely on that for now.
+
 
 use strict; use warnings;
 use File::Slurper qw(read_text read_lines write_text);
 use JSON;
 use Getopt::Long;
-# use Config::Simple;
-# use Path::This '$THISDIR';
+use DateTime::Format::ISO8601; # ->parse_datetime( $str );
+use Config::Simple;
+use File::HomeDir;
+use List::Util qw(any);
+use List::MoreUtils qw(first_index);
+use Text::Table;
+use Term::ReadKey; # Used for GetTerminalSize() and ICANON mode
+my ($termwidth, $termheight, $wpixels, $hpixels) = GetTerminalSize(); # px vals unused
+use Cwd qw(abs_path);
+use File::Basename;
+use Cwd qw(abs_path);
+warn "Adding lib dir: " . dirname (abs_path(__FILE__));
+use lib dirname (abs_path(__FILE__)) . "/lib";
+use jansi;
 
 $| = 1; # Flush stdout each write (so errors are intermingled well)
+ReadMode 'cbreak';
+$SIG{INT} = sub { ReadMode 'normal'; print "Interrupted\n"; exit; }; # Some debugging messages.
+$SIG{PIPE} = sub { ReadMode 'normal'; print "Broken pipe\n"; exit; };
+sub END { ReadMode 'normal'; print "We're normal, srsly\n"; }
 
 # User your hot fresh github auth token or you'll be limited.
 # (I gave my token read:packages and read:user scope.)
 #  https://help.github.com/en/github/authenticating-to-github/creating-a-personal-access-token-for-the-command-line#using-a-token-on-the-command-line
 
-# [ config not implemented ]
-# my $cfg_fn="$THISDIR/config.ini";
-# my $cfg_samp_fn="$THISDIR/config-sample.ini";
-# if (! -f "$cfg_fn") {
-# 	if (! -f "$cfg_samp_fn") {
-# 		warn "No config.ini nor config-sample.ini found in $THISDIR" .
-# 			"We cannot use your git credentials.";
-# my $cfg = new Config::Simple("config.ini");
+my $app_name='github-fork-update-times';
+my $cfg_dir=File::HomeDir->my_dist_config( "$app_name", { create => 1 } );
+my $cfg_fn_lonely="config.ini";  # Plain no-directory filename
+my $cfg_fn="$cfg_dir/$cfg_fn_lonely";
+#
+# If you're only hitting their API a few times, you can run without
+# adding a config file with your github user/token
+my $github_user;                    # Retrieved and stored here
+my $github_token;
 
-my $verbose=0;
-GetOptions(
-		"verbose+"  => \$verbose,
-	) or die("Error in command line arguments\n");
-
-# If you're only hitting their API a few times,
-#  you can set $auth_parms='' a few lines down \/ \/
-my $github_user='{your github username}';
-my $github_token='{your github auth token}';
-my $url="https://github.com/{some_user_here}/{some_repo_here}/network/members";
-
-if ($#ARGV < 0) {
-	print "Usage: me $url\n";
-	exit;
-} else {
-	$url = shift @ARGV;
-	die "I think this is a bad url: $url"
-		if $url !~ m|^\w+://[^/]*github\.com/|;
-}
-
-my $auth_parms="-u '$github_user:$github_token'";
-my ($orig_user, $orig_repo) = ($url =~ m|github.com/(.*?)/(.*?)/|);
-my $cachedir_base="/tmp/github-forks-cache";
-my $prjdir="${orig_user}__$orig_repo";
+my $cfgvar_gh_user="github_user";   # Names of settings in ini file
+my $cfgvar_gh_token="github_token";
+my $cfgvar_cache_dir="cache_dir";   # Full path to cache directory (will default)
+	# storage dir (ex: /tmp/{cachedir_lonely})
+my $cachedir_lonely = "github-forks-cache";
 
 my $gurl = 'https://github.com';
 my $gapiurl = 'https://api.github.com';
+my @url_examples = qw(
+	https://github.com/{some_user}/{some_repo}/network/members
+	https://github.com/brianegan/chewie
+	https://github.com/brianegan/chewie.git
+);
+
+my $verbose=0;
+my $opt_init=0;
+my $opt_quiet=0;
+my $opt_clapi=0; # clear cache of api errors
+my $opt_clache=0; # clear cache and re-download forks
+my $opt_help=0;
+my %cfg;
+my $auth_parms;
+
+my $index_fn_lonely = "idx.html";
+my @cache_other = (
+	".",
+	"..",
+	$index_fn_lonely,
+);  # list of non-fork cache files
+
+GetOptions(
+	"verbose|v+"=> \$verbose,    # Increment verbosity
+	"init"    => \$opt_init,   # Create initial ini if it doesn't exist
+	"quiet|q" => \$opt_quiet,  # Don't complain about missing ini
+	"clapi"   => \$opt_clapi,
+	"clache"  => \$opt_clache, # Clear cache entirely
+	"help|h"  => \$opt_help,   # Display help and leave
+) or die("Error in command line arguments\n");
+if ($opt_help) { help(); exit; }
+%cfg = check_and_get_config($cfg_fn);
+#print map{"CFG $_ = $cfg{$_}\n"} keys %cfg;
+$github_user = $cfg{github_user};
+$github_token = $cfg{github_token};
+die "--clache (clear cache) not implemented yet" if $opt_clache;
+
+my $uurl = get_user_url_from_argv(); # user-given url
+
+my $loss_coefficients = {
+	ctime_utime => 1,
+	utime => 1.5,
+};
+
+if (defined $github_user && defined $github_token) {
+	$auth_parms="-u '$github_user:$github_token'";
+} else {
+	$auth_parms="";
+}
+print "Using auth_parms: \$auth_parms (censored)\n";
+
+my ($orig_user, $orig_repo) = ($uurl =~ m#github.com/(.*?)/(.*?)(?:$|/|\.git$)#);
+	if (!defined $orig_user || !defined $orig_repo) {
+		print STDERR "Badly-formatted url: $uurl\nExamples:\n";
+		print map {" $_\n"} @url_examples;
+	}
+my $cachedir_base;
+	if (exists $cfg{cache_dir} && -d $cfg{cache_dir}) {
+		$cachedir_base = "$cfg{cache_dir}/$cachedir_lonely";
+	} else {
+		$cachedir_base = "/tmp/$cachedir_lonely";
+	}
+my $prjdir="${orig_user}__$orig_repo";
+my $url = "https://github.com/$orig_user/$orig_repo/network/members";
+
 my @updates;
 
 print STDERR "Project name: $orig_repo\n";
 
 	$prjdir =~ tr|/\r\n \t|_|;
 	$prjdir = "$cachedir_base/$prjdir";
+
+	# Clean cache of bad entries
+	if ($opt_clapi) {
+		print "User requested API/cache bad entry clear. Clearing and leaving.\n";
+		clear_cache_api_fails(dir=>$prjdir, ignore_list=>\@cache_other);
+		print "Done. You may run me again -- properly this time please.\n";
+		exit;
+	}
 
 	# Create base cache tmp dir
 	mkdir($cachedir_base, 0700) || $! == 17 || 
@@ -65,12 +138,13 @@ print STDERR "Project name: $orig_repo\n";
 		die "Error creating project tmpdir: $prjdir";
 print STDERR " Cache dir: $prjdir\n";
 
-my $fn_idx = "$prjdir/idx.html";
+my $fn_idx = "$prjdir/$index_fn_lonely";
 print STDERR "Main Index: $fn_idx\n";
 
 	-f "$fn_idx" || `curl $auth_parms -o "$fn_idx" "$url"`;
 	-f "$fn_idx" || die "Download of index unsuccessful";
 
+my @fork_list;
 my @idx_html = read_lines($fn_idx);
     # <a href="/user_here/repo_name_here">react-native-af-video-player</a>
 	for my $l (@idx_html) {
@@ -79,37 +153,243 @@ my @idx_html = read_lines($fn_idx);
 		#print STDERR "Checking for '^\s*<a href=\"(/[^/]+/$orig_repo)\">\n";
 		my ($user) = ($l =~ m|^\s*<a href="/([^/]+)/$orig_repo">|);
 		if (defined $user) {
-			my ($updated_at, @json_lines) =
-				handle_fork_updated_at($user, $orig_repo);
-			my $repo_obj =
-				handle_fork_updated_at($user, $orig_repo);
-			push(@updates, {
-				updated_at => $repo_obj->{updated_at},
-				repo_obj => $repo_obj,
-				user => $user,
-				repo => $orig_repo
-			});
+			push(@fork_list, {user=>$user, repo=>$orig_repo});
 		}
 	}
+	for my $fork (@fork_list) {
+		# Returns $repo_obj (hash)
+		my $repo_obj = repo_get_data_and_json($$fork{user}, $$fork{repo});
+		push(@updates, {
+			repo_obj => $repo_obj,
+			user => $$fork{user},
+			repo => $$fork{repo},
+			json => $$repo_obj{json},
+		});
+	}
 print STDERR "Forks count: ", $#updates+1, "\n";
-my @up_sorted = sort { $a->{updated_at} cmp $b->{updated_at} } @updates;
-print map {
-		update_fork_info($_) . "\n" .
-		($verbose>0 ? "  <- ".$_->{repo_obj}->{json_file}."\n" : "")
-	} @up_sorted;
+my @utime_sorted = sort
+	{ $a->{json}->{updated_at} cmp $b->{json}->{updated_at} } @updates;
+set_minmax(list=>\@utime_sorted, pfx=>'utime');
+
+my @ptime_sorted = sort
+	{ $a->{json}->{pushed_at} cmp $b->{json}->{pushed_at} } @updates;
+set_minmax(list=>\@ptime_sorted, pfx=>'ptime');
+
+my @ctime_sorted = sort
+	{ $a->{json}->{created_at} cmp $b->{json}->{created_at} } @updates;
+set_minmax(list=>\@ctime_sorted, pfx=>'ctime');
+
+my @size_sorted = sort
+	{ $a->{json}->{size} <=> $b->{json}->{size} } @updates;
+set_minmax(list=>\@size_sorted, pfx=>'size');
+
+my @watch_sorted = sort
+	{ $a->{json}->{watchers} <=> $b->{json}->{watchers} } @updates;
+set_minmax(list=>\@watch_sorted, pfx=>'watch');
+
+my @ctime_ptime_diff_sorted = sort
+	{ ptime_minus_ctime($a) <=> ptime_minus_ctime($b) } @updates;
+
+
+my @sort_options = (
+	{
+		arr=>\@utime_sorted,
+		key=>'u',
+		desc=>"(u)pdate time",
+	}, {
+		arr=>\@ptime_sorted,
+		key=>"p",
+		desc=>"(p)time",
+	}, {
+		arr=>\@ctime_sorted,
+		key=>"c",
+		desc=>"(c)time",
+	}, {
+		arr=>\@ctime_ptime_diff_sorted,
+		key=>"-",
+		desc=>"(-)p-ctime",
+	}, {
+		arr=>\@size_sorted,
+		key=>"s",
+		desc=>"(s)ize",
+	},
+	{	arr=>\@watch_sorted,
+		key=>"w",
+		desc=>"(w)atchers",
+	},
+);
+
+my $chosen_list_idx = 4;
+while (1) {
+	my $tb;
+	$tb = Text::Table->new("Ctime", "Push", "Pdiff", "Repo", "Size", "Watchrs");
+#for my $item (@watchers_sorted) { tb_add($tb, $item); }
+#for my $item (@size_sorted) { tb_add($tb, $item); }
+	for my $item (@{$sort_options[$chosen_list_idx]->{arr}}) { tb_add($tb, $item); }
+	my @lines = $tb->table;
+	if ($#lines+1 < $termheight) { print @lines; }
+	else {
+		print @lines[0 .. int($termheight/3-5)];
+		print "...\n";
+		print @lines[$#lines - int($termheight/2-4) .. $#lines];
+		print $lines[0];
+	}
+	print "  ${cya}Sorted by ", $sort_options[$chosen_list_idx]->{desc}, "$rst\n";
+	print "Sort by: ";
+	print join(" ", map {$_->{desc}} @sort_options);
+	print ": ";
+	my $inp =  ReadKey 0;
+	print "$inp\n";
+	last if $inp =~ /^q/i;
+	my $choice = first_index { $_->{key} eq $inp } @sort_options;
+	if ($choice == -1) {
+		print "\nFailure is not an option.. nor is $inp. Try again.\n";
+		sleep 2;
+	}
+	$chosen_list_idx = $choice;
+}
+#print $tb;
+# print map {
+# 	update_fork_info($_) . "\n" .
+# 	($verbose>0 ? "  <- ".$_->{repo_obj}->{json_file}."\n" : "")
+# } @size_sorted;
+# print "^ Size sorted\n";
 
 print "Cache dir:\n $prjdir\n";
 exit;
+
+sub tb_add {
+	my ($tb, $ref) = @_; # $ref->{user, repo, json}
+	# my @cells;
+	# for my $field (@tb_fields) {
+	# 	my $val = ($field->json // 0) ? $ref->{json}->{$field->{rec}} : $ref->{$field->{rec}};
+	# 	push @cells, $val;
+	# }
+	my $user = $ref->{user} // "Missing 'user'";
+	my $repo = $ref->{repo} // "Missing 'repo'";
+	my $utime = $ref->{json}->{updated_at} // "Missing 'updated_at'";
+	my $ctime = $ref->{json}->{created_at} // "Missing 'created_at'";
+	my $ptime = $ref->{json}->{pushed_at} // "Missing 'pushed_at'";
+	my $size = $ref->{json}->{size} // "Missing 'size'";
+	my $watchers = $ref->{json}->{watchers_count} // "Missing 'watchers_count'";
+
+	my $ptime_min_ctime = parse_datetime($ptime) - parse_datetime($ctime);
+	my $push_dist_str = sprintf(
+		"%2sy%2sm%2sd",
+		$ptime_min_ctime->years,
+		$ptime_min_ctime->months,
+		$ptime_min_ctime->days,
+	);
+
+	$tb->add(
+		iso8601short($ctime) . get_minmax_mark(ref=>$ref, pfx=>'ctime'),
+		iso8601short($ptime) . get_minmax_mark(ref=>$ref, pfx=>'ptime'),
+		$push_dist_str,
+		"$gurl/$user/$repo",
+		get_minmax_mark(ref=>$ref, pfx=>'size') . $size . ".",
+		$watchers . get_minmax_mark(ref=>$ref, pfx=>'watch'),
+	);
+}
+
+sub set_minmax {
+	my %opts = @_;
+	my $arr = $opts{list} // die "set_minmax() needs list=>arrayref";
+	my $pfx = $opts{pfx} // die "set_minmax() needs pfx=>string";
+	${$arr}[0]->{"${pfx}_min"}=1;
+	${$arr}[-1]->{"${pfx}_max"}=1;
+}
+
+sub get_minmax {
+	my %opts = @_;
+	my $key = $opts{key} // die "get_minmax requires key=>";
+	my $json = $opts{json} // die "get_minmax requires json=>0 or 1";
+	my $list = $opts{list} // die "get_minmax requires array ref of values";
+	#$DB::single=1;
+	return (${$list}[0], ${$list}[-1]);
+}
+
+sub calc_loss {
+	my $coefs = shift; # hashref to loss_coefficients
+	my $robj = shift;   # repo object
+	my $json = $robj->{repo_obj}->{json};
+
+	print $json;
+		# "updated_at": "2020-05-10T05:23:36Z",
+	my $utime = parse_datetime($json->{updated_at});
+	my $ctime = parse_datetime($json->{created_at});
+
+	print $utime->epoch - $ctime->epoch, "\n";
+	#my $l_cmtime = $obj->{json};
+	#my $loss = $obj->{json_lines
+}
+
+sub parse_datetime {
+	return DateTime::Format::ISO8601->parse_datetime( shift );
+}
+
+
+sub ptime_minus_ctime { # pushed_at minus created_at
+	my $a = shift;
+	my $ctime = parse_datetime($a->{json}->{created_at});
+	my $ptime = parse_datetime($a->{json}->{pushed_at});
+	return $ptime->epoch - $ctime->epoch;
+}
+
+sub mark {
+	my ($vmin, $vmax, $str);
+	return undef if !defined $str;
+	return "-$str" if $str eq $vmin;
+	return "+$str" if $str eq $vmax;
+	return "*$str";
+}
+
+sub get_minmax_mark {
+	my %opts = @_;
+	my $ref = $opts{ref} // die "get_minmax_mark() needs ref=>hashref";
+	my $pfx = $opts{pfx} // die "get_minmax_mark() needs pfx=>string";
+	return ($ref->{"${pfx}_min"} ? "-" : ($ref->{"${pfx}_max"} ? "*" : ""));
+}
 
 sub update_fork_info {
 	my $upref = shift;
 	my $user = $upref->{user} // die "Missing user. Sorry.";
 	my $repo = $upref->{repo} // die "Missing repo for user '$user'";
-	my $updat = $upref->{updated_at} // die "Missing updated_at for $user/$repo";
-	return "[$updat] $gurl/$user/$repo";
+	my $updat = $upref->{json}->{updated_at} // die "Missing updated_at: $user/$repo";
+	my $size = $upref->{json}->{size} // die "Missing size: $user/$repo";
+	#"[$updat] $user";
+	"[$updat] $gurl/$user/$repo";
 }
 
-sub handle_fork_updated_at {
+sub clear_cache_api_fails {
+	my %opts=@_;
+	my $dirp = $opts{dir} //
+		die "clear_cache_api_fails() needs dir=>cache dir";
+	my $exclude = $opts{ignore_list} //
+		die "clear_cache_api_fails() needs ignore_list=>array";
+	# Outputs to STDERR because decode_json() can error to stderr
+	my $d;
+	opendir($d, $dirp) || die "Can't open cache dir: $dirp: $!";
+	while (readdir($d)) {
+		my $fn_plain = $_;
+		my $fn = "$dirp/$fn_plain";
+		print STDERR "File($fn_plain) ";
+		if (any {$_ eq $fn_plain} @cache_other) {
+			print STDERR "Skipping non-fork file\n";
+		} else {
+			my $json_str = read_text($fn);
+			my $json = decode_json($json_str);
+			if (!exists $json->{updated_at}) {
+				print STDERR "REMOVING\n";
+				unlink($fn) || die "Aborting: Can't remove cache file: $fn: $!";
+			} else {
+				print STDERR "Keeping\n";
+			}
+		}
+	}
+	closedir($d);
+}
+
+sub repo_get_data_and_json {
 	# Get fork update time
 	# "updated_at": "2019-01-21T10:00:42Z",
 	my $user = shift;
@@ -118,16 +398,30 @@ sub handle_fork_updated_at {
 	$verbose > 1 && print STDERR "Fork found    : $user/$repo\n";
 	my ($rurl, $cachefn) = get_cached_fork_json($user, $repo);
 	#print STDERR "  Retrieved to: $cachefn\n";
-	my @json_lines = read_lines($cachefn);
-	my $updated_at = (grep {/"updated_at":/} @json_lines)[0];
-	defined $updated_at || die "No updated_at json entry: $cachefn\nURL: $rurl";
-	$verbose > 2 && print STDERR "updated_at line: $updated_at\n";
-	($updated_at) = ($updated_at =~ (m|"updated_at": "(.*?)"|));
+	my $json_str = read_text($cachefn);
+	utf8::encode($json_str);
+	my $json = decode_json($json_str);
+	#my @json_lines = read_lines($cachefn); # double-read until I update
+	if (!exists $json->{updated_at}) {
+		# If API limit reached for non-token user, github returns:
+		# {"message":"API rate limit exceeded for 66.133.203.211. (But here's the good news: Authenticated requests get a higher rate limit. Check out the documentation for more details.)","documentation_url":"https://developer.github.com/v3/#rate-limiting"}
+		if (exists $json->{message}) {
+			warn "\nGithub url $rurl returned an error, we think:\n".
+				" $$json{message}\n";
+			if (exists $json->{documentation_url}) {
+				warn "It also gave a documentation url:\n".
+					" $$json{documentation_url}\n";
+			}
+		}
+		die "No updated_at json entry: $cachefn\nURL: $rurl";
+	}
+	my $updated_at = $json->{updated_at};
+	$verbose > 2 && print STDERR "updated_at item: $updated_at\n";
 	$verbose > 1 && print STDERR "$user/$repo: Update: $updated_at\n";
 	my %obj = (
-		updated_at => $updated_at,
-		json_lines => \@json_lines,
+		#json_lines => \@json_lines,
 		json_file => $cachefn,
+		json => $json,
 	);
 	return \%obj;
 }
@@ -151,4 +445,61 @@ sub store_url_data {
 	-f "$fn" || return 0;
 	return 1;
 }
+
+sub help {
+	print <<EOH;
+Get a github repo's forks' info and try to present them in a useful way
+Usage: github-fork-update-times [options] repository
+  -v | --verbose    Increments verbosity!
+  --init            Initialize config.ini in config dir
+  -q | --quiet      Be quiet about the missing config.ini (and user/token)
+  --clapi           Wanted to be "clappy". Clear the repo's BAD cache entries
+  --clache          Wanted to be "clashy". Clear the repo's cache entirely
+EOH
+}
+
+sub check_and_get_config {
+	my %ourcfg = ();
+	print "Using config: $cfg_fn\n";
+	if (! -f "$cfg_fn") {
+		print "Config file: $cfg_fn\n";
+		if (!$opt_init) {
+			if (!$opt_quiet) {
+				print STDERR "No ini found. Running without github user/api token.\n";
+				print STDERR "Run with --init to create it\n";
+			}
+		} else {
+			# New config
+			my $ncfg = new Config::Simple(syntax=>"simple") ||
+				die "Can't create config $cfg_fn: $!";
+			$ncfg->param($cfgvar_gh_user, "");
+			$ncfg->param($cfgvar_gh_token, "");
+			$ncfg->param("# cfgvar_cache_dir", "/tmp/");
+			$ncfg->write($cfg_fn);
+			print "Created ini. Please leave and edit it...\n";
+			print " $cfg_fn\n";
+			print "IMPORTANT: the format is 'key{whitespace}value' (you'll see)\n";
+			exit;
+		}
+	} else {
+		Config::Simple->import_from($cfg_fn, \%ourcfg) ||
+			die "Error loading config $cfg_fn: $!";
+	}
+	return %ourcfg;
+}
+
+sub get_user_url_from_argv {  # user-given url
+	if ($#ARGV < 0) {
+		print "Usage: me {repo url}\nUse -h for help\n";
+		exit;
+	}
+	my $oururl = shift @ARGV;
+	$#ARGV < 0 || die
+		"You entered more than one non-option argument. Why?\n".
+		"I cannot deal with this right now. I'm leaving.\n".
+		"Talk to me when you calm down.\n";
+	return $oururl;
+}
+
+sub iso8601short { substr($_[0], 0, 10) }
 
