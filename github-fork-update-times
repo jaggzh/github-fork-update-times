@@ -148,10 +148,12 @@ my @fork_list;
 my @idx_html = read_lines($fn_idx);
     # <a href="/user_here/repo_name_here">react-native-af-video-player</a>
 	for my $l (@idx_html) {
-		#print STDERR "Line: $l\n";
+		# print STDERR "Line: $l\n";
 		# Get forked project URI
-		#print STDERR "Checking for '^\s*<a href=\"(/[^/]+/$orig_repo)\">\n";
-		my ($user) = ($l =~ m|^\s*<a href="/([^/]+)/$orig_repo">|);
+		# print STDERR "Checking for '^\s*<a href=\"(/[^/]+/$orig_repo)\">\n";
+		#Line:     <a class="" href="/adnankhalid7454/BRDNet">BRDNet</a>
+		#Checking for '^s*<a href="(/[^/]+/BRDNet)">
+		my ($user) = ($l =~ m|^\s*<a class="" href="/([^/]+)/$orig_repo">|);
 		if (defined $user) {
 			push(@fork_list, {user=>$user, repo=>$orig_repo});
 		}
