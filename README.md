@@ -1,6 +1,7 @@
 This displays a sorted list of a repository's forks' updated times.
-
 It caches the pages to reduce github API hits.
+
+![Screenshot of text interface](img/ss.png)
 
 ## Features
 * Caches the pages (initial repository page and the json forks)
