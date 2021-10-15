@@ -145,6 +145,7 @@ print STDERR "Main Index: $fn_idx\n";
 	-f "$fn_idx" || die "Download of index unsuccessful";
 
 my @fork_list;
+push(@fork_list, {user=>$orig_user, repo=>$orig_repo});
 my @idx_html = read_lines($fn_idx);
     # <a href="/user_here/repo_name_here">react-native-af-video-player</a>
 	for my $l (@idx_html) {
