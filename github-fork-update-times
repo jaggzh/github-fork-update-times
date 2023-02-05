@@ -1,4 +1,5 @@
 #!/usr/bin/perl
+use v5.24;
 # Pass the fork url (list of forks) from github
 # JSON from github is a hashref. We rely on that for now.
 
@@ -22,6 +23,11 @@ warn "Adding lib dir: " . dirname (abs_path(__FILE__));
 use lib dirname (abs_path(__FILE__)) . "/lib";
 use jansi;
 
+sub MODE_REPOS { 1; }
+sub MODE_CONTENTS { 2; }
+my $u_mode = MODE_REPOS;
+my $chosen_list_idx = 4;
+
 $| = 1; # Flush stdout each write (so errors are intermingled well)
 ReadMode 'cbreak';
 $SIG{INT} = sub { ReadMode 'normal'; print "Interrupted\n"; exit; }; # Some debugging messages.
@@ -42,12 +48,18 @@ my $cfg_fn="$cfg_dir/$cfg_fn_lonely";
 my $github_user;                    # Retrieved and stored here
 my $github_token;
 
+##########################################################################
+# Config file-related:
 my $cfgvar_gh_user="github_user";   # Names of settings in ini file
 my $cfgvar_gh_token="github_token";
 my $cfgvar_cache_dir="cache_dir";   # Full path to cache directory (will default)
 	# storage dir (ex: /tmp/{cachedir_lonely})
 my $cachedir_lonely = "github-forks-cache";
 
+# Default config values
+my $cfg_default_cache_dir = "/tmp/";
+
+# URL/API stuff
 my $gurl = 'https://github.com';
 my $gapiurl = 'https://api.github.com';
 my @url_examples = qw(
@@ -81,8 +93,8 @@ GetOptions(
 	"help|h"  => \$opt_help,   # Display help and leave
 ) or die("Error in command line arguments\n");
 if ($opt_help) { help(); exit; }
-%cfg = check_and_get_config($cfg_fn);
-#print map{"CFG $_ = $cfg{$_}\n"} keys %cfg;
+%cfg = check_and_get_config_with_defaults($cfg_fn);
+# print map{"CFG $_ = $cfg{$_}\n"} keys %cfg;
 $github_user = $cfg{github_user};
 $github_token = $cfg{github_token};
 die "--clache (clear cache) not implemented yet" if $opt_clache;
@@ -112,15 +124,16 @@ my $cachedir_base;
 	} else {
 		$cachedir_base = "/tmp/$cachedir_lonely";
 	}
-my $prjdir="${orig_user}__$orig_repo";
 my $url = "https://github.com/$orig_user/$orig_repo/network/members";
+my $dn_user_repo  = fnplain_sanitize("${orig_user}__$orig_repo");
+my $prjdir = "$cachedir_base/$dn_user_repo";
+my $prjdir_contents = "$prjdir/contents";
 
 my @updates;
 
 print STDERR "Project name: $orig_repo\n";
-
-	$prjdir =~ tr|/\r\n \t|_|;
-	$prjdir = "$cachedir_base/$prjdir";
+print STDERR " Project dir:  $prjdir\n";
+print STDERR "Contents dir:  $prjdir_contents\n";
 
 	# Clean cache of bad entries
 	if ($opt_clapi) {
@@ -136,6 +149,9 @@ print STDERR "Project name: $orig_repo\n";
 	# Create project tmp dir
 	mkdir($prjdir, 0700) || $! == 17 || 
 		die "Error creating project tmpdir: $prjdir";
+	# Create project tmp dir for file listing/contents
+	mkdir($prjdir_contents, 0700) || $! == 17 || 
+		die "Error creating project tmpdir 4 contents: $prjdir_contents";
 print STDERR " Cache dir: $prjdir\n";
 
 my $fn_idx = "$prjdir/$index_fn_lonely";
@@ -167,6 +183,7 @@ my @idx_html = read_lines($fn_idx);
 			user => $$fork{user},
 			repo => $$fork{repo},
 			json => $$repo_obj{json},
+			cont_json => $$repo_obj{cont_json},
 		});
 	}
 print STDERR "Forks count: ", $#updates+1, "\n";
@@ -222,8 +239,7 @@ my @sort_options = (
 	},
 );
 
-my $chosen_list_idx = 4;
-while (1) {
+sub mode_repos {
 	my $tb;
 	$tb = Text::Table->new("Ctime", "Push", "Pdiff", "Repo", "Size", "Watchrs");
 #for my $item (@watchers_sorted) { tb_add($tb, $item); }
@@ -237,20 +253,89 @@ while (1) {
 		print @lines[$#lines - int($termheight/2-4) .. $#lines];
 		print $lines[0];
 	}
-	print "  ${cya}Sorted by ", $sort_options[$chosen_list_idx]->{desc}, "$rst\n";
+	print "  (${cya}q$rst)uit, (${cya}f$rst)ile view  [".
+	      "${cya}Sorted by $bcya", $sort_options[$chosen_list_idx]->{desc}, "$rst]\n";
 	print "Sort by: ";
 	print join(" ", map {$_->{desc}} @sort_options);
 	print ": ";
 	my $inp =  ReadKey 0;
 	print "$inp\n";
-	last if $inp =~ /^q/i;
+	if ($inp =~ /^q/i) { return -1; }
+	elsif ($inp =~ /^f/i) { $u_mode = MODE_CONTENTS; return 0; }
 	my $choice = first_index { $_->{key} eq $inp } @sort_options;
 	if ($choice == -1) {
 		print "\nFailure is not an option.. nor is $inp. Try again.\n";
 		sleep 2;
 	}
 	$chosen_list_idx = $choice;
+	return 0;
 }
+
+sub content_files_from_json {
+	my $json = shift;
+	return map { $_->{name}; } @$json;
+}
+
+sub content_files_from_json_hash {
+	my $json = shift;
+	my @fns = content_files_from_json($json);
+	return map { ( $_ => 1 ); } @fns;
+}
+
+sub hash_remove_hashkeys {
+	my ($hash, $remme) = @_;
+	for my $k (keys %$remme) {
+		delete $$hash{$k};
+	}
+	return $hash;
+}
+
+sub github_url_from_user_repo {
+	my $u = shift; my $r = shift;
+	return "https://github.com/$u/$r";
+}
+
+sub mode_contents {
+	my $mainhr = $updates[0];
+	my %mainfns = content_files_from_json_hash($$mainhr{cont_json});
+	my $ui = 0;
+	my $uimax = $#updates+1;
+
+	say '';
+	say "Main repo files [ $$mainhr{user} / $$mainhr{repo} ]";
+	print map { "  $_\n"; } sort keys %mainfns;
+	# print map { "$$_{user}\n"; } sort { lc $$a{user} cmp lc $$b{user}; } @updates[1..$#updates];
+	for my $uhr (sort { lc($$a{user}) cmp lc($$b{user}); } @updates[1..$#updates]) {
+		$ui++;
+		my $json = $$uhr{cont_json};
+		my %fns = content_files_from_json_hash($json);
+		%fns = %{hash_remove_hashkeys(\%fns, \%mainfns)};
+		if (length(%fns) > 1) {
+			my $u = $$uhr{user};
+			my $r = $$uhr{repo};
+			my $url = github_url_from_user_repo($u, $r);
+			say "Fork [$ui/$uimax]: $u / $r ($url)";
+			print  map { "  $_\n"; } sort keys %fns;
+		}
+	}
+	print "(m)ain listing, (q)uit: ";
+	my $inp =  ReadKey 0;
+	print "$inp\n";
+	if ($inp =~ /^q/i) { return -1; }
+	elsif ($inp =~ /^m/i) { $u_mode = MODE_REPOS; }
+	return 0;
+}
+
+while (1) {
+	my $rc;
+	if ($u_mode == MODE_REPOS) {
+		$rc = mode_repos();
+	} elsif ($u_mode = MODE_CONTENTS) {
+		$rc = mode_contents();
+	}
+	last if $rc == -1;
+}
+
 #print $tb;
 # print map {
 # 	update_fork_info($_) . "\n" .
@@ -378,6 +463,7 @@ sub clear_cache_api_fails {
 		print STDERR "File($fn_plain) ";
 		if (any {$_ eq $fn_plain} @cache_other) {
 			print STDERR "Skipping non-fork file\n";
+		} elsif (! -f $fn) { # skip non-files
 		} else {
 			my $json_str = read_text($fn);
 			my $json = decode_json($json_str);
@@ -399,11 +485,11 @@ sub repo_get_data_and_json {
 	my $repo = shift;
 	#$verbose > 0 && print STDERR "\n";
 	$verbose > 1 && print STDERR "Fork found    : $user/$repo\n";
-	my ($rurl, $cachefn) = get_cached_fork_json($user, $repo);
+	my ($rurl, $cachefn, $json) =
+		get_cached_fork_json($user, $repo);
+	my ($rurlcont, $cachefncont, $jsoncont) =
+		get_cached_repo_contents_json($user, $repo, '/');
 	#print STDERR "  Retrieved to: $cachefn\n";
-	my $json_str = read_text($cachefn);
-	utf8::encode($json_str);
-	my $json = decode_json($json_str);
 	#my @json_lines = read_lines($cachefn); # double-read until I update
 	if (!exists $json->{updated_at}) {
 		# If API limit reached for non-token user, github returns:
@@ -425,19 +511,48 @@ sub repo_get_data_and_json {
 		#json_lines => \@json_lines,
 		json_file => $cachefn,
 		json => $json,
+		cont_json_file => $cachefncont,
+		cont_json => $jsoncont,
 	);
 	return \%obj;
+}
+
+sub fnplain_sanitize { my $fn = shift;
+	$fn =~ tr|/\r\n \t|_|;
+	return $fn;
+}
+
+sub fn_to_json {
+	my $fn = shift;
+	my $json_str = read_text($fn);
+	utf8::encode($json_str);
+	my $json = decode_json($json_str);
+	return $json;
+}
+
+
+sub get_cached_repo_contents_json {
+	my ($user, $repo, $path) = @_;
+	my $url = "$gapiurl/repos/$user/$repo/contents$path";
+	my $urlfile = fnplain_sanitize("${user}_$repo");
+	my $cachefn = "$prjdir_contents/$urlfile";
+	-f "$cachefn" || store_url_data($cachefn, $url) ||
+		die "Don't have and couldn't retrieve fork repo file contents:\n"
+			. "  Url: $url\n  Destination: $cachefn";
+	my $json = fn_to_json($cachefn);
+	return ($url, $cachefn, $json);
 }
 
 sub get_cached_fork_json {
 	my ($user, $repo) = @_;
 	my $url = "$gapiurl/repos/$user/$repo";
-	my $urlfile = "${user}_$repo";
-	$urlfile =~ tr|/|_|; # for safety
+	my $urlfile = fnplain_sanitize("${user}_$repo");
 	my $cachefn = "$prjdir/$urlfile";
 	-f "$cachefn" || store_url_data($cachefn, $url) ||
-		die "Don't have and couldn't retrieve fork: $url\nDestination: $cachefn";
-	return ($url, $cachefn);
+		die "Don't have and couldn't retrieve fork:\n"
+			. "  Url: $url\n  Destination: $cachefn";
+	my $json = fn_to_json($cachefn);
+	return ($url, $cachefn, $json);
 }
 
 sub store_url_data {
@@ -461,7 +576,7 @@ Usage: github-fork-update-times [options] repository
 EOH
 }
 
-sub check_and_get_config {
+sub check_and_get_config_with_defaults {
 	my %ourcfg = ();
 	print "Using config: $cfg_fn\n";
 	if (! -f "$cfg_fn") {
@@ -477,16 +592,18 @@ sub check_and_get_config {
 				die "Can't create config $cfg_fn: $!";
 			$ncfg->param($cfgvar_gh_user, "");
 			$ncfg->param($cfgvar_gh_token, "");
-			$ncfg->param("# cfgvar_cache_dir", "/tmp/");
+			$ncfg->param($cfgvar_cache_dir, $cfg_default_cache_dir);
 			$ncfg->write($cfg_fn);
 			print "Created ini. Please leave and edit it...\n";
-			print " $cfg_fn\n";
+			print " Edit me -> $cfg_fn\n";
 			print "IMPORTANT: the format is 'key{whitespace}value' (you'll see)\n";
 			exit;
 		}
 	} else {
 		Config::Simple->import_from($cfg_fn, \%ourcfg) ||
 			die "Error loading config $cfg_fn: $!";
+		$ourcfg{$cfgvar_cache_dir} = $cfg_default_cache_dir
+			if !exists $ourcfg{$cfgvar_cache_dir};
 	}
 	return %ourcfg;
 }
