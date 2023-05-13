@@ -42,6 +42,7 @@ my $app_name='github-fork-update-times';
 my $cfg_dir=File::HomeDir->my_dist_config( "$app_name", { create => 1 } );
 my $cfg_fn_lonely="config.ini";  # Plain no-directory filename
 my $cfg_fn="$cfg_dir/$cfg_fn_lonely";
+print STDERR "Config location: $cfg_fn\n";
 #
 # If you're only hitting their API a few times, you can run without
 # adding a config file with your github user/token
